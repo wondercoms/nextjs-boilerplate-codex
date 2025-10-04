@@ -1,0 +1,136 @@
+name: Auto PR on DEV branches
+
+on:
+  push:
+    branches:
+      - 'DEV-*'
+      - 'feat/DEV-*'
+      - 'fix/DEV-*'
+      - '**/DEV-*'     # 深い階層のブランチ名にも対応
+  workflow_dispatch: {} # 手動実行テスト用
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set base & extract vars
+        run: |
+          echo "BRANCH=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          echo "BASE=${{ github.event.repository.default_branch }}" >> $GITHUB_ENV
+          ISSUE_KEY=$(echo "${GITHUB_REF_NAME}" | grep -oE 'DEV-[0-9]+' || true)
+          echo "ISSUE_KEY=${ISSUE_KEY}" >> $GITHUB_ENV
+
+      - name: Ensure PR exists (create or reuse)
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const branch   = process.env.BRANCH;
+            const base     = process.env.BASE || context.payload.repository.default_branch;
+            const issueKey = process.env.ISSUE_KEY || branch;
+            const title    = `${issueKey}: auto PR`;
+            const body     = `Backlog: https://wondercoms.backlog.com/view/${issueKey}\n\n変更点:\n- 叩き台PR`;
+
+            // 既存 Open PR を再利用
+            const openPrs = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', head: `${owner}:${branch}`, base, per_page: 100
+            });
+            if (openPrs.length) { core.setOutput('url', openPrs[0].html_url); return; }
+
+            // 閉じた PR があれば再オープン
+            const closedPrs = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'closed', head: `${owner}:${branch}`, base, per_page: 100
+            });
+            if (closedPrs.length) {
+              const reopened = await github.rest.pulls.update({
+                owner, repo, pull_number: closedPrs[0].number, state: 'open'
+              });
+              core.setOutput('url', reopened.data.html_url); return;
+            }
+
+            // 新規 PR を作成
+            const pr = await github.rest.pulls.create({ owner, repo, title, head: branch, base, body });
+            core.setOutput('url', pr.data.html_url);
+
+      - name: Echo PR URL
+        run: echo "PR URL = ${{ steps.pr.outputs.url }}"
+
+      # ─────────────────────────────────────────────
+      # Backlog デバッグ（原因切り分け）
+      # ─────────────────────────────────────────────
+      - name: Debug Backlog credentials (temporary)
+        if: env.ISSUE_KEY != ''
+        env:
+          BACKLOG_DOMAIN: ${{ secrets.BACKLOG_DOMAIN }}   # 例: wondercoms.backlog.com（https://不要）
+          BACKLOG_API_KEY: ${{ secrets.BACKLOG_API_KEY }} # 個人APIキー（課題にコメント権限のあるユーザー）
+        run: |
+          set -euo pipefail
+          # ドメイン整形（https://除去・末尾スラ削除・空白改行除去）
+          DOMAIN="$(echo -n "$BACKLOG_DOMAIN" | sed -e 's#^https\?://##' -e 's#/*$##' | tr -d ' \r\n')"
+          KEY="$(echo -n "$BACKLOG_API_KEY" | tr -d ' \r\n')"
+          echo "DOMAIN=${DOMAIN}"
+          echo "ISSUE=${ISSUE_KEY}"
+
+          echo "🔎 /users/myself で認証確認中..."
+          HTTP=$(curl -s -o /tmp/me.json -w '%{http_code}' "https://${DOMAIN}/api/v2/users/myself?apiKey=${KEY}" || true)
+          echo "HTTP=${HTTP}"
+          if [ "$HTTP" != "200" ]; then
+            echo "❌ Backlog 認証失敗。レスポンス:"
+            cat /tmp/me.json || true
+            exit 1
+          fi
+          echo "✅ Auth OK"
+
+          echo "🔎 /issues/${ISSUE_KEY} へのアクセス権確認中..."
+          IHTTP=$(curl -s -o /tmp/issue.json -w '%{http_code}' "https://${DOMAIN}/api/v2/issues/${ISSUE_KEY}?apiKey=${KEY}" || true)
+          echo "HTTP=${IHTTP}"
+          if [ "$IHTTP" != "200" ]; then
+            echo "⚠️ 課題へのアクセスで200以外。コメント権限やキーのプロジェクト所属を確認してください。レスポンス:"
+            cat /tmp/issue.json || true
+            # ここでは失敗にしない（コメントStepで再度エラー出力）
+          fi
+
+      # ─────────────────────────────────────────────
+      # Backlog に PR URL をコメント（本番）
+      # ─────────────────────────────────────────────
+      - name: Comment PR URL to Backlog
+        if: env.ISSUE_KEY != '' && steps.pr.outputs.url != ''
+        env:
+          BACKLOG_DOMAIN: ${{ secrets.BACKLOG_DOMAIN }}
+          BACKLOG_API_KEY: ${{ secrets.BACKLOG_API_KEY }}
+        run: |
+          set -euo pipefail
+          DOMAIN="$(echo -n "$BACKLOG_DOMAIN" | sed -e 's#^https\?://##' -e 's#/*$##' | tr -d ' \r\n')"
+          KEY="$(echo -n "$BACKLOG_API_KEY" | tr -d ' \r\n')"
+          ISSUE="${ISSUE_KEY}"
+          PR_URL='${{ steps.pr.outputs.url }}'
+
+          echo "📝 Backlog コメント投稿: issue=${ISSUE}"
+          # 認証再確認（ここで失敗させて詳細ログを残す）
+          curl -fsS "https://${DOMAIN}/api/v2/users/myself?apiKey=${KEY}" >/dev/null
+
+          # コメント投稿：HTTPコードを取得（200/201を成功扱い）
+          STATUS="$(curl -sS -o /tmp/backlog_comment.json -w '%{http_code}' -X POST \
+            "https://${DOMAIN}/api/v2/issues/${ISSUE}/comments?apiKey=${KEY}" \
+            --data-urlencode "content=自動生成PR: ${PR_URL}")"
+
+          echo "Response body:"; cat /tmp/backlog_comment.json || true
+          echo "HTTP=${STATUS}"
+
+          if [ "$STATUS" = "200" ] || [ "$STATUS" = "201" ]; then
+            echo "✅ Backlog ${ISSUE} にコメントしました"
+          else
+            echo "❌ Backlog コメント失敗（HTTP=${STATUS}）"
+            exit 1
+          fi

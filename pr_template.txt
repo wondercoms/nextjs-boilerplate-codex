@@ -1,0 +1,40 @@
+タスク:
+Backlog の課題 {ISSUE_KEY}（https://wondercoms.backlog.com/view/{ISSUE_KEY}）を MCP で取得し、記載の新仕様に基づいて Next.js リポに最小限の修正を加え、ブランチ作成→コミット→プッシュまで行う（PR作成とBacklogコメントは GitHub Actions が自動で実施）。
+
+前提・重要事項（探索禁止の明示）:
+- 書き込みは app/**, components/**, content/**, public/** のみ。
+- **lint / typecheck / build は実行しない。**
+- すべてのコミットは **main から新規ブランチを切って**行う。
+- git の履歴要約は不要。必要な git コマンドは --no-pager で最小限のみ。
+
+手順（あなた＝Codexが順に実行する）:
+1) Backlog 課題取得と要約
+   - MCP backlog.get_issue("{ISSUE_KEY}") と、必要に応じて backlog.get_issue_comments("{ISSUE_KEY}") を呼び、要約を1〜2行で作成。
+   - 仕様から「URL/ルート／対象ファイル／修正内容」を **1箇所** に限定して抽出。曖昧なら課題本文を優先。
+
+2) 変更計画（最小差分）
+   - 新規画像は必要な場合のみ public/backlog/{ISSUE_KEY}/ を使う。
+
+3) 実装（**直接編集**）
+   - 対象ファイルのみを直接編集して実装する（新規作成は必要であれば行う）。
+   - **許可外パスの混入ガード**を実行し、該当があれば即中断して報告：
+     CHANGED="$(git --no-pager diff --name-only || true)"
+     BAD="$(echo "$CHANGED" | grep -Ev '^(app/|components/|content/|public/)$' || true)"
+     if [ -n "$BAD" ]; then
+       echo "❌ 非許可パスへの変更が含まれています:"; echo "$BAD"; exit 1
+     fi
+
+4) ブランチ作成・コミット・プッシュ（**必ず main 起点**）
+   - git checkout main && git pull
+   - git checkout -b feat/{ISSUE_KEY}-auto
+   - git add -A
+   - git commit -m "{ISSUE_KEY}: <短い要約>"
+   - git push -u origin feat/{ISSUE_KEY}-auto
+
+5) PR作成とBacklogコメントは GitHub Actions に任せる
+   - push 完了後、Actions の "Auto PR on DEV branches" 実行を待ち、PR URL を確認する（BacklogへのPR URLコメントも自動で実施される）
+
+出力フォーマット:
+- {ISSUE_KEY} 要約（1〜2行）
+- 変更ファイル一覧
+- 成否と要点（1行）
